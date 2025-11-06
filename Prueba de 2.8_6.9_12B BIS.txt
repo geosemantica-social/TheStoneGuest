@@ -1,0 +1,465 @@
+"""
+TEST VALIDACIÓN 2.8B, 6.9B, 12B - PYTHIA
+Confirmación de transiciones T2, T3, T4
+Optimizado para Google Colab T4 (16GB VRAM)
+Tiempo estimado: ~2 horas
+
+INSTRUCCIONES:
+1. Ejecutar en Colab con GPU T4
+2. Primera celda: !pip install -q -U transformers accelerate bitsandbytes scipy
+3. Runtime > Restart runtime
+4. Ejecutar este script
+"""
+
+import torch
+import numpy as np
+from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
+from scipy import stats
+import gc
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================
+# CONFIGURACIÓN PARA T4 (CRÍTICO)
+# ============================================
+class OptimizedSemanticAnalyzer:
+    """
+    Versión ultra-optimizada para T4 con 16GB
+    """
+    def __init__(self, model_name: str, use_8bit: bool = True):
+        print(f"🔧 Cargando {model_name}...")
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # SINTAXIS MODERNA de cuantización
+        try:
+            if use_8bit:
+                quantization_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    llm_int8_threshold=6.0
+                )
+                self.model = AutoModel.from_pretrained(
+                    model_name,
+                    quantization_config=quantization_config,
+                    device_map="auto",
+                    torch_dtype=torch.float16
+                )
+                print("✅ Modelo cargado en 8-bit")
+            else:
+                raise Exception("Usando fallback FP16")
+                
+        except Exception as e:
+            print(f"⚠️  8-bit falló ({e}), usando FP16...")
+            # FALLBACK: FP16 sin cuantización
+            self.model = AutoModel.from_pretrained(
+                model_name,
+                device_map="auto",
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True
+            )
+            print("✅ Modelo cargado en FP16 (sin cuantización)")
+        
+        self.model.eval()
+    
+    def compute_S_composite(self, text: str) -> float:
+        """
+        Métrica S compuesta (del paper)
+        S = (local_coherence × top5_variance) / (isotropy + 0.1)
+        """
+        # Tokenizar
+        inputs = self.tokenizer(
+            text, 
+            return_tensors='pt', 
+            truncation=True, 
+            max_length=64,  # Reducido para velocidad
+            padding=True
+        )
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        
+        # Forward pass
+        with torch.no_grad():
+            outputs = self.model(**inputs, output_hidden_states=True)
+        
+        # Embeddings última capa
+        embeddings = outputs.hidden_states[-1][0].cpu().float().numpy()
+        
+        # 1. LOCAL COHERENCE (gradiente semántico)
+        if len(embeddings) > 1:
+            cosine_sims = []
+            for i in range(len(embeddings) - 1):
+                sim = np.dot(embeddings[i], embeddings[i+1]) / (
+                    np.linalg.norm(embeddings[i]) * np.linalg.norm(embeddings[i+1]) + 1e-8
+                )
+                cosine_sims.append(sim)
+            local_coh = np.mean(cosine_sims)
+        else:
+            local_coh = 0
+        
+        # 2. TOP5 VARIANCE (concentración espectral)
+        _, s, _ = np.linalg.svd(embeddings, full_matrices=False)
+        total_var = np.sum(s**2)
+        top5_var = np.sum(s[:5]**2) / (total_var + 1e-8)
+        
+        # 3. ISOTROPY (uniformidad de normas)
+        norms = np.linalg.norm(embeddings, axis=1)
+        isotropy = np.std(norms) / (np.mean(norms) + 1e-8)
+        
+        # MÉTRICA COMPUESTA
+        S = (local_coh * top5_var) / (isotropy + 0.1)
+        
+        return S
+    
+    def analyze_batch(self, sentences: list) -> dict:
+        """
+        Procesa batch con limpieza de memoria
+        """
+        results = {'S_values': [], 'texts': []}
+        
+        for i, sent in enumerate(sentences):
+            try:
+                S = self.compute_S_composite(sent)
+                results['S_values'].append(S)
+                results['texts'].append(sent)
+                
+                # Limpiar cada 5 oraciones
+                if (i + 1) % 5 == 0:
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    
+            except Exception as e:
+                print(f"⚠️ Error en oración {i}: {e}")
+                continue
+        
+        return results
+
+
+# ============================================
+# CORPUS DE PRUEBA (ESPAÑOL)
+# ============================================
+corpus = {
+    'coherent': [
+        "La teoría cuántica describe el comportamiento de partículas subatómicas.",
+        "El cambio climático afecta los ecosistemas marinos globalmente.",
+        "Las redes neuronales aprenden patrones complejos de los datos.",
+        "La música clásica influyó profundamente la cultura europea.",
+        "Los algoritmos de aprendizaje profundo transforman la inteligencia artificial.",
+        "La geometría diferencial estudia las propiedades de variedades curvas.",
+        "El desarrollo sostenible requiere equilibrio entre economía y medio ambiente.",
+        "La evolución biológica ocurre mediante selección natural continua.",
+    ],
+    'broken': [
+        "Subatómicas partículas de comportamiento el describe cuántica teoría la.",
+        "Globalmente marinos ecosistemas los afecta climático cambio el.",
+        "Datos los de complejos patrones aprenden neuronales redes las.",
+        "Europea cultura la profundamente influyó clásica música la.",
+        "Artificial inteligencia la transforman profundo aprendizaje de algoritmos los.",
+        "Curvas variedades de propiedades las estudia diferencial geometría la.",
+        "Ambiente medio y economía entre equilibrio requiere sostenible desarrollo el.",
+        "Continua natural selección mediante ocurre biológica evolución la.",
+    ]
+}
+
+
+# ============================================
+# FUNCIÓN PRINCIPAL DE TEST
+# ============================================
+def test_large_models():
+    """
+    Test específico para 2.8B, 6.9B y 12B
+    Validación de transiciones T2, T3, T4
+    """
+    
+    print("="*60)
+    print("🧪 TEST VALIDACIÓN MODELOS GRANDES")
+    print("="*60)
+    print("Objetivo: Confirmar transiciones en:")
+    print("  T2: 2.8B  - Octava (ratio 2.00 desde 1.4B)")
+    print("  T3: 6.9B  - Territorio (ratio 2.46 desde 2.8B)")
+    print("  T4: 12B   - Protección (ratio 1.74 desde 6.9B)")
+    print("\nPredicciones esperadas:")
+    print("  ΔS < 0 (inversión de fase)")
+    print("  p < 0.05 (significancia estadística)")
+    print("  |d| > 1.5 (efecto grande)")
+    print("="*60)
+    
+    # MODELOS A TESTEAR - SOLO LOS GRANDES
+    models_to_test = [
+        ('EleutherAI/pythia-2.8b', 2.8e9, True),   # T2: Octave
+        ('EleutherAI/pythia-6.9b', 6.9e9, True),   # T3: Territory
+        ('EleutherAI/pythia-12b', 12e9, True),     # T4: Protection
+    ]
+    
+    results_summary = {}
+    
+    for model_name, n_params, use_8bit in models_to_test:
+        print(f"\n{'='*60}")
+        print(f"📊 MODELO: {model_name} ({n_params/1e9:.1f}B parámetros)")
+        print("="*60)
+        
+        try:
+            # Inicializar analizador
+            analyzer = OptimizedSemanticAnalyzer(model_name, use_8bit=use_8bit)
+            
+            # Analizar corpus
+            print("🔍 Analizando corpus coherente...")
+            coh_results = analyzer.analyze_batch(corpus['coherent'])
+            
+            print("🔍 Analizando corpus sintaxis rota...")
+            broken_results = analyzer.analyze_batch(corpus['broken'])
+            
+            # Calcular estadísticas
+            S_coh = np.array(coh_results['S_values'])
+            S_broken = np.array(broken_results['S_values'])
+            
+            mean_coh = np.mean(S_coh)
+            mean_broken = np.mean(S_broken)
+            delta_S = mean_coh - mean_broken
+            
+            # Test t
+            t_stat, p_val = stats.ttest_ind(S_coh, S_broken)
+            
+            # Cohen's d
+            pooled_std = np.sqrt((np.var(S_coh) + np.var(S_broken)) / 2)
+            cohens_d = delta_S / (pooled_std + 1e-8)
+            
+            # Guardar resultados
+            results_summary[model_name] = {
+                'n_params': n_params,
+                'S_coh': mean_coh,
+                'S_broken': mean_broken,
+                'ΔS': delta_S,
+                'p_value': p_val,
+                'cohens_d': cohens_d,
+                'inversion': delta_S < 0,
+                'significant': p_val < 0.05
+            }
+            
+            # Imprimir resultados
+            print(f"\n📈 RESULTADOS:")
+            print(f"  S(coherente):     {mean_coh:.4f}")
+            print(f"  S(sintaxis rota): {mean_broken:.4f}")
+            print(f"  ΔS = S_coh - S_broken: {delta_S:.4f}")
+            print(f"  p-value: {p_val:.6f}")
+            print(f"  Cohen's d: {cohens_d:.4f}")
+            
+            
+            
+            # Limpiar memoria
+            del analyzer
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+        except Exception as e:
+            print(f"❌ Error procesando {model_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # ============================================
+    # ANÁLISIS DE RATIOS
+    # ============================================
+    print("\n" + "="*60)
+    print("📊 ANÁLISIS DE RATIOS DE SCALING")
+    print("="*60)
+    
+    if len(results_summary) >= 2:
+        # Ordenar por parámetros
+        models_sorted = sorted(results_summary.items(), key=lambda x: x[1]['n_params'])
+        
+        print("\nResumen de todos los modelos:")
+        print("-" * 60)
+        for model_name, res in models_sorted:
+            model_short = model_name.split('/')[-1]
+            status = "✅" if res['inversion'] and res['significant'] else "⚠️"
+            print(f"{status} {model_short:15s} ({res['n_params']/1e9:5.2f}B) | "
+                  f"ΔS={res['ΔS']:+.3f} | p={res['p_value']:.5f} | d={res['cohens_d']:+.2f}")
+        
+        # Calcular ratios
+        print("\n🔢 RATIOS DE SCALING:")
+        print("-" * 60)
+        ratios = []
+        for i in range(len(models_sorted) - 1):
+            n1 = models_sorted[i][1]['n_params']
+            n2 = models_sorted[i+1][1]['n_params']
+            ratio = n2 / n1
+            ratios.append(ratio)
+            
+            name1 = models_sorted[i][0].split('/')[-1]
+            name2 = models_sorted[i+1][0].split('/')[-1]
+            print(f"  {name2} / {name1} = {ratio:.3f}")
+        
+        # Análisis de ratios
+        if len(ratios) >= 2:
+            print("\n📐 ANÁLISIS ESTADÍSTICO DE RATIOS:")
+            print("-" * 60)
+            mean_ratio = np.mean(ratios)
+            std_ratio = np.std(ratios)
+            cv = std_ratio / mean_ratio
+            
+            print(f"  Media: {mean_ratio:.3f}")
+            print(f"  Desviación estándar: {std_ratio:.3f}")
+            print(f"  Coeficiente de variación: {cv:.2%}")
+            
+            # Comparación con constantes teóricas
+            print("\n  Comparación con constantes:")
+            candidates = {
+                'φ² (golden²)': 2.618,
+                '√8': 2.828,
+                'e': 2.718,
+                '432/174': 2.483,
+            }
+            
+            for name, val in candidates.items():
+                diff = abs(mean_ratio - val)
+                pct = (diff / val) * 100
+                marker = "✅" if pct < 10 else "⚠️" if pct < 20 else "❌"
+                print(f"    {marker} {name:15s} = {val:.3f} | diff = {diff:.3f} ({pct:.1f}%)")
+            
+            # Buscar mejor match individual
+            print("\n  Mejor match por ratio individual:")
+            for idx, r in enumerate(ratios):
+                print(f"\n  Ratio {idx+1} = {r:.3f}:")
+                best_match = None
+                best_diff = float('inf')
+                
+                for name, val in candidates.items():
+                    diff = abs(r - val)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_match = (name, val)
+                
+                if best_match:
+                    pct = (best_diff / best_match[1]) * 100
+                    print(f"    → {best_match[0]} = {best_match[1]:.3f} (error: {pct:.1f}%)")
+    
+    # ============================================
+    # ANÁLISIS DE RESONANCIA MONOGRAMAS
+    # ============================================
+    print("\n" + "="*60)
+    print("🎵 ANÁLISIS DE RESONANCIA CON MONOGRAMAS TdST")
+    print("="*60)
+    
+    monograms = {
+        '埍 Territorio': 432,
+        '暘 Tiempo-Luz': 528,
+        'ሐ Meltha': 111,
+        'ॐ Pacificación': 136.1,
+        'ᛉ Algiz': 741,
+        '候 Inercia': 396,
+        'ᚦ Corte': 852,
+        '豐 Abundancia': 639,
+        'Ñ Identidad': 417,
+        '☩ Camino': 963,
+        '★ Esperanza': 999,
+        'ঈ Dulzura': 174,
+    }
+    
+    if len(ratios) > 0:
+        print("\nBuscando correspondencias frecuenciales...")
+        print("-" * 60)
+        
+        freqs = list(monograms.values())
+        
+        for idx, r in enumerate(ratios):
+            print(f"\n📻 Ratio r{idx+1} = {r:.3f}:")
+            matches = []
+            
+            # Buscar pares de frecuencias que den ratio cercana
+            for i, f1 in enumerate(freqs):
+                for j, f2 in enumerate(freqs):
+                    if i != j and f1 < f2:  # Solo ascendentes
+                        freq_ratio = f2 / f1
+                        diff = abs(freq_ratio - r)
+                        if diff < 0.20:  # Tolerancia más amplia
+                            name1 = [k for k, v in monograms.items() if v == f1][0]
+                            name2 = [k for k, v in monograms.items() if v == f2][0]
+                            matches.append((name1, name2, f1, f2, freq_ratio, diff))
+            
+            # Ordenar por mejor match
+            matches = sorted(matches, key=lambda x: x[5])
+            
+            if matches:
+                print(f"  Resonancias encontradas:")
+                for m in matches[:3]:  # Top 3
+                    error_pct = (m[5] / r) * 100
+                    marker = "🎯" if m[5] < 0.05 else "✅" if m[5] < 0.10 else "⚠️"
+                    print(f"    {marker} {m[1]:18s} / {m[0]:18s}")
+                    print(f"       {m[3]:6.1f} Hz / {m[2]:6.1f} Hz = {m[4]:.3f} (error: {error_pct:.1f}%)")
+            else:
+                print(f"  ⚠️  No se encontraron resonancias claras (tolerancia ±0.20)")
+    
+    # ============================================
+    # PREDICCIÓN PRÓXIMA TRANSICIÓN
+    # ============================================
+    print("\n" + "="*60)
+    print("🔮 PREDICCIÓN PRÓXIMA TRANSICIÓN (T5)")
+    print("="*60)
+    
+    if len(models_sorted) > 0 and len(ratios) > 0:
+        last_params = models_sorted[-1][1]['n_params']
+        last_ratio = ratios[-1]
+        mean_ratio = np.mean(ratios) if len(ratios) > 1 else last_ratio
+        
+        print(f"\nÚltimo modelo: {models_sorted[-1][0].split('/')[-1]} ({last_params/1e9:.1f}B)")
+        print(f"Última ratio: {last_ratio:.3f}")
+        if len(ratios) > 1:
+            print(f"Media de ratios: {mean_ratio:.3f}")
+        
+        print("\nPredicciones T5:")
+        print("-" * 60)
+        
+        # Predicción 1: Última ratio
+        pred1 = last_params * last_ratio
+        print(f"  Usando última ratio ({last_ratio:.3f}): {pred1/1e9:.1f}B")
+        
+        # Predicción 2: Media
+        if len(ratios) > 1:
+            pred2 = last_params * mean_ratio
+            print(f"  Usando media ({mean_ratio:.3f}): {pred2/1e9:.1f}B")
+        
+        # Predicción 3: Convergencia (ratio decreciente)
+        if len(ratios) >= 2:
+            # Ajuste lineal de ratios
+            x = np.arange(len(ratios))
+            slope, intercept = np.polyfit(x, ratios, 1)
+            next_ratio = slope * len(ratios) + intercept
+            pred3 = last_params * next_ratio
+            print(f"  Convergencia lineal ({next_ratio:.3f}): {pred3/1e9:.1f}B")
+        
+        # Predicción 4: Constantes teóricas
+        print(f"\n  Referencias teóricas desde {last_params/1e9:.1f}B:")
+        for name, val in [('φ²', 2.618), ('√8', 2.828), ('e', 2.718)]:
+            pred = last_params * val
+            print(f"    × {name} ({val:.3f}): {pred/1e9:.1f}B")
+    
+    print("\n" + "="*60)
+    print("✅ TEST COMPLETADO")
+    print("="*60)
+    
+    return results_summary
+
+
+# ============================================
+# EJECUTAR
+# ============================================
+if __name__ == "__main__":
+    print("🚀 Iniciando validación modelos grandes...")
+    print("⏱️  Tiempo estimado: ~2 horas")
+    print("💾 Asegúrate de estar en GPU T4\n")
+    
+    # Verificar GPU
+    if torch.cuda.is_available():
+        print(f"✅ GPU detectada: {torch.cuda.get_device_name(0)}")
+        print(f"💾 VRAM disponible: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB\n")
+    else:
+        print("❌ No se detectó GPU. Este script requiere GPU.")
+        exit(1)
+    
+    results = test_large_models()
+    
+    print("\n🎯 PRÓXIMOS PASOS:")
+    print("  1. Comparar con resultados previos de 6.9B")
+    print("  2. Ejecutar test completo 70M-12B para secuencia total")
+    print("  3. Computar κ_s y ψ_te para Transparencia Coloidal")
